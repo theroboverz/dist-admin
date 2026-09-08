@@ -18,6 +18,14 @@ const toDateStr = (v) => {
     return String(v).slice(0, 10);
 };
 
+// Real employee_id / intern_uid when set on the person's record; otherwise a
+// stable, computed fallback from their DB id — never a fabricated identity.
+const formatDisplayId = (role, rawCode, dbId) => {
+    if (rawCode) return rawCode;
+    if (dbId === null || dbId === undefined) return null;
+    return `${role === 'employee' ? 'EMP' : 'INT'}-${String(dbId).padStart(3, '0')}`;
+};
+
 const addDays = (dateStr, days) => {
     const d = new Date(dateStr + 'T00:00:00Z');
     d.setUTCDate(d.getUTCDate() + days);
@@ -87,7 +95,7 @@ async function fetchEmployeeTaskBars(scope, filters) {
     const [rows] = await db.execute(
         `SELECT t.id, t.title, t.description, t.assigned_to, t.assigned_by, t.priority, t.status,
                 t.start_date, t.deadline, t.progress_percent, t.project_id, t.created_at,
-                i.name AS assignee_name
+                i.name AS assignee_name, i.employee_id AS assignee_code, i.profile_pic AS assignee_photo
          FROM employee_tasks t
          LEFT JOIN interns i ON i.intern_id = t.assigned_to
          WHERE ${where.join(' AND ')}
@@ -95,8 +103,10 @@ async function fetchEmployeeTaskBars(scope, filters) {
         params
     );
 
+    const todayStr = istDateStr();
     return rows.map(t => {
         const start = toDateStr(t.start_date) || toDateStr(t.created_at);
+        const end = toDateStr(t.deadline) || start;
         return {
         id: `et-${t.id}`,
         sourceType: 'employee_task',
@@ -104,11 +114,15 @@ async function fetchEmployeeTaskBars(scope, filters) {
         projectId: t.project_id,
         title: t.title,
         description: t.description,
-        assignee: { id: t.assigned_to, name: t.assignee_name, role: 'employee' },
+        assignee: {
+            id: t.assigned_to, name: t.assignee_name, role: 'employee',
+            displayId: formatDisplayId('employee', t.assignee_code, t.assigned_to),
+            photo: t.assignee_photo || null,
+        },
         start,
-        end: toDateStr(t.deadline) || start,
+        end,
         rawStatus: t.status,
-        colorStatus: employeeTaskColor(t.status),
+        colorStatus: employeeTaskColor(t.status, t.deadline ? end : null, todayStr),
         progressPercent: t.progress_percent || 0,
         priority: t.priority,
         isSyntheticAssignee: false,
@@ -128,7 +142,7 @@ async function fetchInternTaskBars(scope, filters) {
 
     if (scope.type === 'intern') {
         const [internRows] = await db.execute(
-            'SELECT name, domain_id, batch, intern_type FROM interns WHERE intern_id = ?',
+            'SELECT name, domain_id, batch, intern_type, intern_uid, profile_pic FROM interns WHERE intern_id = ?',
             [scope.userId]
         );
         if (!internRows.length) return [];
@@ -160,7 +174,7 @@ async function fetchInternTaskBars(scope, filters) {
             params
         );
 
-        return rows.map(t => buildInternTaskBar(t, { id: scope.userId, name: intern.name }));
+        return rows.map(t => buildInternTaskBar(t, { id: scope.userId, name: intern.name, code: intern.intern_uid, photo: intern.profile_pic }));
     }
 
     // admin scope
@@ -183,7 +197,8 @@ async function fetchInternTaskBars(scope, filters) {
     const placeholders = taskIds.map(() => '?').join(',');
 
     const [submissions] = await db.execute(
-        `SELECT its.task_id, its.intern_id, its.status, its.progress, its.approved_progress, i.name
+        `SELECT its.task_id, its.intern_id, its.status, its.progress, its.approved_progress,
+                i.name, i.intern_uid, i.profile_pic
          FROM intern_task_submissions its
          JOIN interns i ON i.intern_id = its.intern_id
          WHERE its.task_id IN (${placeholders})`,
@@ -200,7 +215,7 @@ async function fetchInternTaskBars(scope, filters) {
         const subs = submissionsByTask.get(t.task_id) || [];
         if (subs.length) {
             for (const s of subs) {
-                bars.push(buildInternTaskBar(t, { id: s.intern_id, name: s.name }, s));
+                bars.push(buildInternTaskBar(t, { id: s.intern_id, name: s.name, code: s.intern_uid, photo: s.profile_pic }, s));
             }
         } else {
             const label = t.assignment_range === 'group' ? `Group: ${t.target_group}` : 'All Interns';
@@ -216,6 +231,8 @@ function buildInternTaskBar(t, assignee, sub, isPlaceholder = false) {
     const approvedProgress = sub ? sub.approved_progress : t.approved_progress;
     const progress = subStatus === 'approved' ? (approvedProgress ?? 100) : (subProgress || 0);
     const startDate = toDateStr(t.start_date) || toDateStr(t.created_at);
+    const end = toDateStr(t.deadline) || startDate;
+    const todayStr = istDateStr();
     return {
         id: `t-${t.task_id}-${assignee.id ?? 'group'}`,
         sourceType: 'intern_task',
@@ -225,11 +242,15 @@ function buildInternTaskBar(t, assignee, sub, isPlaceholder = false) {
         domainName: t.domain_name,
         title: t.title,
         description: t.description,
-        assignee: { id: assignee.id, name: assignee.name, role: 'intern' },
+        assignee: {
+            id: assignee.id, name: assignee.name, role: 'intern',
+            displayId: assignee.id != null ? formatDisplayId('intern', assignee.code, assignee.id) : null,
+            photo: assignee.photo || null,
+        },
         start: startDate,
-        end: toDateStr(t.deadline) || startDate,
+        end,
         rawStatus: subStatus,
-        colorStatus: internTaskColor(subStatus),
+        colorStatus: internTaskColor(subStatus, t.deadline ? end : null, todayStr),
         progressPercent: progress,
         priority: null,
         isSyntheticAssignee: isPlaceholder,
@@ -240,14 +261,16 @@ function buildInternTaskBar(t, assignee, sub, isPlaceholder = false) {
 // Assemble groups[] — real projects + synthetic "Unassigned" buckets
 // ─────────────────────────────────────────────
 function assembleGroups(projects, employeeBars, internBars, filters) {
+    const todayStr = istDateStr();
     const groupsByProjectId = new Map();
     for (const p of projects) {
+        const deadlineStr = toDateStr(p.deadline);
         groupsByProjectId.set(p.id, {
             id: p.id,
             title: p.title,
             rawStatus: p.status,
-            colorStatus: projectColor(p.status),
-            deadline: p.deadline,
+            colorStatus: projectColor(p.status, deadlineStr, todayStr),
+            deadline: deadlineStr,
             assigneeName: p.assignee_name,
             isSynthetic: false,
             tasks: [],
@@ -258,6 +281,7 @@ function assembleGroups(projects, employeeBars, internBars, filters) {
 
     const passesFilters = (bar) => {
         if (filters.status && bar.rawStatus !== filters.status) return false;
+        if (filters.colorStatus && bar.colorStatus !== filters.colorStatus) return false;
         if (filters.assigneeId && String(bar.assignee.id) !== String(filters.assigneeId)) return false;
         if (filters.startDate && bar.end < filters.startDate) return false;
         if (filters.endDate && bar.start > filters.endDate) return false;
@@ -316,6 +340,7 @@ function parseFilters(query) {
         endDate: query.endDate || addDays(today, 60),
         projectId: query.projectId ? parseInt(query.projectId) : null,
         status: query.status || null,
+        colorStatus: query.colorStatus || null,
         priority: query.priority || null,
         assigneeId: query.assigneeId || null,
         taskType: query.taskType || 'all',
@@ -392,7 +417,7 @@ exports.getTaskDetail = async (req, res) => {
                 status: 'success',
                 data: {
                     ...task,
-                    colorStatus: employeeTaskColor(task.status),
+                    colorStatus: employeeTaskColor(task.status, toDateStr(task.deadline), istDateStr()),
                     comments,
                     progressLogs: logs,
                 },
